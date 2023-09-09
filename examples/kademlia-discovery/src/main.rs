@@ -80,6 +80,13 @@ const BOOTNODES: [(&str, &str); 10] = [
     ),
 ];
 
+// We create a custom network behaviour that combines Kademlia and mDNS.
+#[derive(NetworkBehaviour)]
+struct MyBehaviour {
+    kademlia: Kademlia<MemoryStore>,
+    mdns: mdns::async_io::Behaviour,
+}
+
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
@@ -93,32 +100,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .authenticate(noise::Config::new(&local_key)?)
         .multiplex(yamux::Config::default())
         .boxed();
-
-    // We create a custom network behaviour that combines Kademlia and mDNS.
-    #[derive(NetworkBehaviour)]
-    #[behaviour(to_swarm = "MyBehaviourEvent")]
-    struct MyBehaviour {
-        kademlia: Kademlia<MemoryStore>,
-        mdns: mdns::async_io::Behaviour,
-    }
-
-    #[allow(clippy::large_enum_variant)]
-    enum MyBehaviourEvent {
-        Kademlia(KademliaEvent),
-        Mdns(mdns::Event),
-    }
-
-    impl From<KademliaEvent> for MyBehaviourEvent {
-        fn from(event: KademliaEvent) -> Self {
-            MyBehaviourEvent::Kademlia(event)
-        }
-    }
-
-    impl From<mdns::Event> for MyBehaviourEvent {
-        fn from(event: mdns::Event) -> Self {
-            MyBehaviourEvent::Mdns(event)
-        }
-    }
 
     // Create a swarm to manage peers and events.
     let mut swarm = {
