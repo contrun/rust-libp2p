@@ -26,7 +26,7 @@ use core::task::Poll;
 use futures::channel::{mpsc, oneshot};
 use futures::future::poll_fn;
 use futures::prelude::*;
-use libp2p::identify::{Identify, IdentifyEvent};
+use libp2p::identify;
 use libp2p::kad::record::{
     store::{Error as RecordError, MemoryStore},
     Key,
@@ -35,12 +35,13 @@ use libp2p::kad::{
     AddProviderError, AddProviderOk, BootstrapError, BootstrapOk, GetClosestPeersOk,
     GetProvidersError, GetProvidersOk, Kademlia, KademliaEvent, QueryId, QueryResult,
 };
+use libp2p::swarm::SwarmBuilder;
 use libp2p::{
     development_transport,
     identity::Keypair,
     multiaddr::Multiaddr,
-    swarm::{NetworkBehaviourEventProcess, SwarmEvent},
-    NetworkBehaviour, PeerId, Swarm, TransportError,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    PeerId, Swarm, TransportError,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -95,37 +96,64 @@ type KadResult = Result<(), KadError>;
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     kad: Kademlia<MemoryStore>,
-    identify: Identify,
-    #[behaviour(ignore)]
-    queries: HashMap<QueryId, oneshot::Sender<KadResult>>,
-    #[behaviour(ignore)]
-    name: &'static str,
-    #[behaviour(ignore)]
-    peers: HashMap<PeerId, &'static str>,
+    identify: identify::Behaviour,
 }
 
 impl Behaviour {
-    fn new(name: &'static str, kad: Kademlia<MemoryStore>, identify: Identify) -> Self {
-        Self {
+    fn new(kad: Kademlia<MemoryStore>, identify: identify::Behaviour) -> Self {
+        Self { kad, identify }
+    }
+}
+
+struct Swarmer {
+    name: &'static str,
+    peer_id: PeerId,
+    addr: Multiaddr,
+    queries: HashMap<QueryId, oneshot::Sender<KadResult>>,
+    peers: HashMap<PeerId, &'static str>,
+    swarm: Swarm<Behaviour>,
+}
+
+impl Swarmer {
+    async fn new(name: &'static str) -> Result<Self, InitError> {
+        let key = Keypair::generate_ed25519();
+        let peer_id = PeerId::from(key.public());
+        let identify = identify::Behaviour::new(identify::Config::new("test".into(), key.public()));
+        let transport = development_transport(key).await?;
+        let store = MemoryStore::new(peer_id.clone());
+        let kad = Kademlia::new(peer_id.clone(), store);
+        let behaviour = Behaviour::new(kad, identify);
+        let mut swarm =
+            SwarmBuilder::with_tokio_executor(transport, behaviour, peer_id.clone()).build();
+        swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())?;
+        let addr = loop {
+            match swarm.select_next_some().await {
+                SwarmEvent::NewListenAddr { address, .. } => break address,
+                SwarmEvent::ListenerClosed { .. } => return Err(InitError::ListenOn),
+                _ => {}
+            }
+        };
+        Ok(Self {
             name,
-            kad,
-            identify,
+            peer_id,
+            addr,
             queries: Default::default(),
             peers: Default::default(),
-        }
+            swarm,
+        })
     }
 
-    fn add_name(&mut self, name: &'static str, peer_id: PeerId) {
+    fn add_peer_name(&mut self, name: &'static str, peer_id: PeerId) {
         self.peers.insert(peer_id, name);
     }
 
-    fn add_address(&mut self, name: &'static str, peer_id: PeerId, addr: Multiaddr) {
-        self.kad.add_address(&peer_id, addr);
-        self.add_name(name, peer_id);
+    fn add_peer_address(&mut self, name: &'static str, peer_id: PeerId, addr: Multiaddr) {
+        self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+        self.add_peer_name(name, peer_id);
     }
 
     fn bootstrap(&mut self, ret: oneshot::Sender<KadResult>) {
-        match self.kad.bootstrap() {
+        match self.swarm.behaviour_mut().kad.bootstrap() {
             Ok(id) => {
                 self.queries.insert(id, ret);
             }
@@ -136,7 +164,7 @@ impl Behaviour {
     }
 
     fn start_providing(&mut self, key: Key, ret: oneshot::Sender<KadResult>) {
-        match self.kad.start_providing(key) {
+        match self.swarm.behaviour_mut().kad.start_providing(key) {
             Ok(id) => {
                 self.queries.insert(id, ret);
             }
@@ -147,7 +175,7 @@ impl Behaviour {
     }
 
     fn get_provider(&mut self, key: Key, ret: oneshot::Sender<KadResult>) {
-        let id = self.kad.get_providers(key.clone());
+        let id = self.swarm.behaviour_mut().kad.get_providers(key.clone());
         self.queries.insert(id, ret);
     }
 
@@ -160,147 +188,12 @@ impl Behaviour {
             ret.send(result).ok();
         }
     }
-}
-
-impl NetworkBehaviourEventProcess<IdentifyEvent> for Behaviour {
-    fn inject_event(&mut self, event: IdentifyEvent) {
-        match event {
-            IdentifyEvent::Received { peer_id, info, .. } => {
-                for addr in info.listen_addrs {
-                    self.kad.add_address(&peer_id, addr);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-impl NetworkBehaviourEventProcess<KademliaEvent> for Behaviour {
-    fn inject_event(&mut self, event: KademliaEvent) {
-        match event {
-            KademliaEvent::QueryResult { id, result, stats } => {
-                let stats = format!(
-                    "{}/{}/{}",
-                    stats.num_requests(),
-                    stats.num_successes(),
-                    stats.num_failures()
-                );
-                match result {
-                    QueryResult::Bootstrap(Ok(BootstrapOk {
-                        num_remaining,
-                        peer,
-                    })) => {
-                        println!(
-                            "{}: bootstrap {} {}",
-                            self.name,
-                            self.get_name(&peer),
-                            &stats
-                        );
-                        if num_remaining == 0 {
-                            self.notify(id, Ok(()));
-                        }
-                    }
-                    QueryResult::Bootstrap(Err(BootstrapError::Timeout {
-                        num_remaining,
-                        peer,
-                    })) => {
-                        println!(
-                            "{}: bootstrap timeout {} {:?} {}",
-                            self.name,
-                            self.get_name(&peer),
-                            num_remaining,
-                            &stats
-                        );
-                        match num_remaining {
-                            Some(0) => self.notify(id, Ok(())),
-                            None => self.notify(id, Err(KadError::Bootstrap)),
-                            _ => {}
-                        }
-                    }
-                    QueryResult::GetProviders(Ok(GetProvidersOk {
-                        key: _,
-                        providers,
-                        closest_peers: _,
-                    })) => {
-                        println!("{}: get providers {}", self.name, &stats);
-                        if providers.is_empty() {
-                            self.notify(id, Err(KadError::NoProvider));
-                        } else {
-                            self.notify(id, Ok(()));
-                        }
-                    }
-                    QueryResult::GetProviders(Err(GetProvidersError::Timeout { .. })) => {
-                        println!("{}: get providers timeout {}", self.name, &stats);
-                        self.notify(id, Err(KadError::Timeout));
-                    }
-                    QueryResult::StartProviding(Ok(AddProviderOk { .. })) => {
-                        println!("{}: start providing {}", self.name, &stats);
-                        self.notify(id, Ok(()));
-                    }
-                    QueryResult::StartProviding(Err(AddProviderError::Timeout { .. })) => {
-                        println!("{}: start providing timeout {}", self.name, &stats);
-                        self.notify(id, Err(KadError::Timeout));
-                    }
-                    QueryResult::GetClosestPeers(Ok(GetClosestPeersOk { .. })) => {
-                        println!("{}: get closest peers {}", self.name, &stats);
-                    }
-                    q => println!("{}: {} {:#?}", self.name, &stats, q),
-                }
-            }
-            KademliaEvent::RoutingUpdated { peer, .. } => {
-                println!("{}: routing updated {}", self.name, self.get_name(&peer));
-            }
-            KademliaEvent::UnroutablePeer { peer } => {
-                println!("{}: unroutable peer {}", self.name, self.get_name(&peer));
-            }
-            KademliaEvent::Discovered { peer_id, .. } => {
-                println!("{}: discovered {}", self.name, self.get_name(&peer_id));
-            }
-        }
-    }
-}
-
-struct Swarmer {
-    name: &'static str,
-    peer_id: PeerId,
-    addr: Multiaddr,
-    swarm: Swarm<Behaviour>,
-}
-
-impl Swarmer {
-    async fn new(name: &'static str) -> Result<Self, InitError> {
-        let key = Keypair::generate_ed25519();
-        let peer_id = PeerId::from(key.public());
-        let identify = Identify::new("a".into(), "b".into(), key.public());
-        let transport = development_transport(key)?;
-        let store = MemoryStore::new(peer_id.clone());
-        let kad = Kademlia::new(peer_id.clone(), store);
-        let behaviour = Behaviour::new(name, kad, identify);
-        let mut swarm = Swarm::new(transport, behaviour, peer_id.clone());
-        Swarm::listen_on(&mut swarm, "/ip4/127.0.0.1/tcp/0".parse().unwrap())?;
-        let addr = loop {
-            match swarm.next_event().await {
-                SwarmEvent::NewListenAddr(addr) => break addr,
-                SwarmEvent::ListenerClosed { .. } => return Err(InitError::ListenOn),
-                _ => {}
-            }
-        };
-        println!("peer {} {}", peer_id.to_string(), addr.to_string());
-        Ok(Self {
-            name,
-            peer_id,
-            addr,
-            swarm,
-        })
+    fn add_swarm_name(&mut self, swarmer: &Swarmer) {
+        self.add_peer_name(swarmer.name, swarmer.peer_id.clone());
     }
 
-    fn add_name(&mut self, swarmer: &Swarmer) {
-        self.swarm.add_name(swarmer.name, swarmer.peer_id.clone());
-    }
-
-    fn add_address(&mut self, swarmer: &Swarmer) {
-        self.swarm
-            .add_address(swarmer.name, swarmer.peer_id.clone(), swarmer.addr.clone());
+    fn add_swarm_address(&mut self, swarmer: &Swarmer) {
+        self.add_peer_address(swarmer.name, swarmer.peer_id.clone(), swarmer.addr.clone());
     }
 
     fn spawn(self) -> Ctrl {
@@ -321,7 +214,108 @@ impl Swarmer {
             }
             loop {
                 match Pin::new(&mut swarm).poll_next(ctx) {
-                    Poll::Ready(Some(())) => {}
+                    Poll::Ready(Some(event)) => match event {
+                        SwarmEvent::Behaviour(BehaviourEvent::Identify(
+                            identify::Event::Received { peer_id, info, .. },
+                        )) => {
+                            for addr in info.listen_addrs {
+                                self.kad.add_address(&peer_id, addr);
+                            }
+                        }
+                        SwarmEvent::Behaviour(BehaviourEvent::Kad(
+                            KademliaEvent::OutboundQueryProgressed {
+                                id, result, stats, ..
+                            },
+                        )) => {
+                            let stats = format!(
+                                "{}/{}/{}",
+                                stats.num_requests(),
+                                stats.num_successes(),
+                                stats.num_failures()
+                            );
+                            match result {
+                                QueryResult::Bootstrap(Ok(BootstrapOk {
+                                    num_remaining,
+                                    peer,
+                                })) => {
+                                    println!(
+                                        "{}: bootstrap {} {}",
+                                        self.name,
+                                        self.get_name(&peer),
+                                        &stats
+                                    );
+                                    if num_remaining == 0 {
+                                        self.notify(id, Ok(()));
+                                    }
+                                }
+                                QueryResult::Bootstrap(Err(BootstrapError::Timeout {
+                                    num_remaining,
+                                    peer,
+                                })) => {
+                                    println!(
+                                        "{}: bootstrap timeout {} {:?} {}",
+                                        self.name,
+                                        self.get_name(&peer),
+                                        num_remaining,
+                                        &stats
+                                    );
+                                    match num_remaining {
+                                        Some(0) => self.notify(id, Ok(())),
+                                        None => self.notify(id, Err(KadError::Bootstrap)),
+                                        _ => {}
+                                    }
+                                }
+                                QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders {
+                                    key: _,
+                                    providers,
+                                    closest_peers: _,
+                                })) => {
+                                    println!("{}: get providers {}", self.name, &stats);
+                                    if providers.is_empty() {
+                                        self.notify(id, Err(KadError::NoProvider));
+                                    } else {
+                                        self.notify(id, Ok(()));
+                                    }
+                                }
+                                QueryResult::GetProviders(Err(GetProvidersError::Timeout {
+                                    ..
+                                })) => {
+                                    println!("{}: get providers timeout {}", self.name, &stats);
+                                    self.notify(id, Err(KadError::Timeout));
+                                }
+                                QueryResult::StartProviding(Ok(AddProviderOk { .. })) => {
+                                    println!("{}: start providing {}", self.name, &stats);
+                                    self.notify(id, Ok(()));
+                                }
+                                QueryResult::StartProviding(Err(AddProviderError::Timeout {
+                                    ..
+                                })) => {
+                                    println!("{}: start providing timeout {}", self.name, &stats);
+                                    self.notify(id, Err(KadError::Timeout));
+                                }
+                                QueryResult::GetClosestPeers(Ok(GetClosestPeersOk { .. })) => {
+                                    println!("{}: get closest peers {}", self.name, &stats);
+                                }
+                                q => println!("{}: {} {:#?}", self.name, &stats, q),
+                            }
+                        }
+                        SwarmEvent::Behaviour(BehaviourEvent::Kad(
+                            KademliaEvent::RoutingUpdated { peer, .. },
+                        )) => {
+                            println!("{}: routing updated {}", self.name, self.get_name(&peer));
+                        }
+                        SwarmEvent::Behaviour(BehaviourEvent::Kad(
+                            KademliaEvent::UnroutablePeer { peer },
+                        )) => {
+                            println!("{}: unroutable peer {}", self.name, self.get_name(&peer));
+                        }
+                        SwarmEvent::Behaviour(BehaviourEvent::Kad(KademliaEvent::Discovered {
+                            peer_id,
+                            ..
+                        })) => {
+                            println!("{}: discovered {}", self.name, self.get_name(&peer_id));
+                        }
+                    },
                     Poll::Ready(None) => return Poll::Ready(()),
                     Poll::Pending => break,
                 }
