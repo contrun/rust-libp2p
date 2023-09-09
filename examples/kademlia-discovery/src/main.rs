@@ -32,9 +32,53 @@ use libp2p::kad::{
 use libp2p::{
     identity, mdns, noise,
     swarm::{NetworkBehaviour, SwarmBuilder, SwarmEvent},
-    tcp, yamux, PeerId, Transport,
+    tcp, yamux, Multiaddr, PeerId, Transport,
 };
 use std::error::Error;
+use std::str::FromStr;
+
+const BOOTNODES: [(&str, &str); 10] = [
+    (
+        "/dnsaddr/bootstrap.libp2p.io",
+        "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+    ),
+    (
+        "/dnsaddr/bootstrap.libp2p.io",
+        "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+    ),
+    (
+        "/dnsaddr/bootstrap.libp2p.io",
+        "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+    ),
+    (
+        "/dnsaddr/bootstrap.libp2p.io",
+        "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+    ),
+    (
+        "/ip4/104.131.131.82/tcp/4001",
+        "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+    ), // mars.i.ipfs.io
+    (
+        "/ip4/104.131.131.82/tcp/4001",
+        "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+    ),
+    (
+        "/ip4/104.236.179.241/tcp/4001",
+        "QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM",
+    ),
+    (
+        "/ip4/104.236.76.40/tcp/4001",
+        "QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64",
+    ),
+    (
+        "/ip4/128.199.219.111/tcp/4001",
+        "QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu",
+    ),
+    (
+        "/ip4/178.62.158.247/tcp/4001",
+        "QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd",
+    ),
+];
 
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -80,7 +124,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut swarm = {
         // Create a Kademlia behaviour.
         let store = MemoryStore::new(local_peer_id);
-        let kademlia = Kademlia::new(local_peer_id, store);
+        let mut kademlia = Kademlia::new(local_peer_id, store);
+        for (addr, id) in &BOOTNODES {
+            kademlia.add_address(
+                &PeerId::from_str(id).unwrap(),
+                Multiaddr::from_str(addr).unwrap(),
+            );
+        }
+        kademlia.bootstrap().unwrap();
         let mdns = mdns::async_io::Behaviour::new(mdns::Config::default(), local_peer_id)?;
         let behaviour = MyBehaviour { kademlia, mdns };
         SwarmBuilder::with_async_std_executor(transport, behaviour, local_peer_id).build()
