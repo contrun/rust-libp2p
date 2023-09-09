@@ -29,67 +29,33 @@ use libp2p::kad::{
     record::Key, AddProviderOk, GetProvidersOk, GetRecordOk, Kademlia, KademliaEvent, PeerRecord,
     PutRecordOk, QueryResult, Quorum, Record,
 };
+use libp2p::multiaddr::Protocol;
+use libp2p::ping;
+use libp2p::swarm::keep_alive;
 use libp2p::{
-    identity, mdns, noise,
+    identity, noise,
     swarm::{NetworkBehaviour, SwarmBuilder, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Transport,
 };
 use std::error::Error;
 use std::str::FromStr;
 
-const BOOTNODES: [(&str, &str); 10] = [
-    (
-        "/dnsaddr/bootstrap.libp2p.io",
-        "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-    ),
-    (
-        "/dnsaddr/bootstrap.libp2p.io",
-        "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-    ),
-    (
-        "/dnsaddr/bootstrap.libp2p.io",
-        "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-    ),
-    (
-        "/dnsaddr/bootstrap.libp2p.io",
-        "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-    ),
-    (
-        "/ip4/104.131.131.82/tcp/4001",
-        "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-    ), // mars.i.ipfs.io
-    (
-        "/ip4/104.131.131.82/tcp/4001",
-        "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-    ),
-    (
-        "/ip4/104.236.179.241/tcp/4001",
-        "QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM",
-    ),
-    (
-        "/ip4/104.236.76.40/tcp/4001",
-        "QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64",
-    ),
-    (
-        "/ip4/128.199.219.111/tcp/4001",
-        "QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu",
-    ),
-    (
-        "/ip4/178.62.158.247/tcp/4001",
-        "QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd",
-    ),
-];
-
 // We create a custom network behaviour that combines Kademlia and mDNS.
 #[derive(NetworkBehaviour)]
 struct MyBehaviour {
     kademlia: Kademlia<MemoryStore>,
-    mdns: mdns::async_io::Behaviour,
+    keep_alive: keep_alive::Behaviour,
+    ping: ping::Behaviour,
 }
 
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
+
+    let mut bootnodes: Vec<String> = vec![];
+    if let Ok(bootnode) = std::env::var("BOOTNODE") {
+        bootnodes = bootnode.split(",").map(ToString::to_string).collect();
+    }
 
     // Create a random key for ourselves.
     let local_key = identity::Keypair::generate_ed25519();
@@ -106,15 +72,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Create a Kademlia behaviour.
         let store = MemoryStore::new(local_peer_id);
         let mut kademlia = Kademlia::new(local_peer_id, store);
-        for (addr, id) in &BOOTNODES {
-            kademlia.add_address(
-                &PeerId::from_str(id).unwrap(),
-                Multiaddr::from_str(addr).unwrap(),
-            );
+        for addr in &bootnodes {
+            let addr = Multiaddr::from_str(addr).unwrap();
+            let protocol = addr.clone().pop();
+            let peer_id = match protocol {
+                Some(Protocol::P2p(peer_id)) => peer_id,
+                _ => panic!("Addr is not of the form /ip4/127.0.0.1/tcp/1000/p2p/peer_id: {addr}"),
+            };
+            kademlia.add_address(&peer_id, addr);
         }
-        kademlia.bootstrap().unwrap();
-        let mdns = mdns::async_io::Behaviour::new(mdns::Config::default(), local_peer_id)?;
-        let behaviour = MyBehaviour { kademlia, mdns };
+        let res = kademlia.bootstrap();
+        dbg!(&res);
+        let ping = ping::Behaviour::default();
+        let keep_alive = keep_alive::Behaviour::default();
+        let behaviour = MyBehaviour {
+            kademlia,
+            ping,
+            keep_alive,
+        };
         SwarmBuilder::with_async_std_executor(transport, behaviour, local_peer_id).build()
     };
 
@@ -130,15 +105,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         select! {
         line = stdin.select_next_some() => handle_input_line(&mut swarm.behaviour_mut().kademlia, line.expect("Stdin not to close")),
-        event = swarm.select_next_some() => match event {
+        event = swarm.select_next_some() => {
+            match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("Listening in {address:?}");
             },
-            SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                for (peer_id, multiaddr) in list {
-                    swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr);
-                }
-            }
             SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(KademliaEvent::OutboundQueryProgressed { result, ..})) => {
                 match result {
                     QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders { key, providers, .. })) => {
@@ -190,6 +161,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             _ => {}
+        }
         }
         }
     }
