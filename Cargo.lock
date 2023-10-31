@@ -3118,6 +3118,7 @@ dependencies = [
 name = "libp2p-tls"
 version = "0.3.0"
 dependencies = [
+ "env_logger 0.10.0",
  "futures",
  "futures-rustls",
  "hex",

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn can_establish_connection() {
+    env_logger::init();
     let mut swarm1 = make_swarm();
     let mut swarm2 = make_swarm();
 
